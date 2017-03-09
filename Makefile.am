@@ -372,7 +372,7 @@ ALL_LOCAL += flake8-check
 #   H238 old style class declaration, use new style (inherit from `object`)
 flake8-check: $(FLAKE8_PYFILES)
 	$(AM_V_GEN) if flake8 $^ --select=H231,H232,H233,H238 ${FLAKE8_FLAGS} && \
-		flake8 $^ --ignore=E121,E123,E125,E126,E127,E128,E129,E131,W503,F811,D,H ${FLAKE8_FLAGS}; then \
+		flake8 $^ --ignore=E121,E123,E125,E126,E127,E128,E129,E131,W503,F811,D,H,I100,I201,I101 ${FLAKE8_FLAGS}; then \
 		touch $@; else exit 1; fi
 endif
 CLEANFILES += flake8-check
