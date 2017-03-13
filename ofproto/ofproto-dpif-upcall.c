@@ -15,7 +15,7 @@
 #include <config.h>
 #include "ofproto-dpif-upcall.h"
 // avi_c - add libconfig
-#include <libconfig.h>
+//#include <libconfig.h>
 
 #include <errno.h>
 #include <stdbool.h>
@@ -721,6 +721,7 @@ static void ofproto_read_flow_limit_group(config_setting_t *group_config,struct 
 
 static void ofproto_read_sbcr_params_group(config_setting_t *group_config,struct udpif *udpif)
 {
+#ifdef notdef
 	if(config_setting_lookup_int (group_config, "sliding_window_size", (int64_t*)&udpif->sbcr_sliding_window_size) != CONFIG_TRUE)
 	{
 		VLOG_ERR ("read_sbcr_params_group - could not find sliding_window_size in group. skipping");
@@ -745,12 +746,13 @@ static void ofproto_read_sbcr_params_group(config_setting_t *group_config,struct
 	{
 		VLOG_ERR ("read_flow_limit_group - could not find sbcr_span_cleaning_intensity in group. skipping");
 	}
-
+#endif
 
 }
 
 static void ofproto_handle_config_group(config_setting_t *group_config,struct udpif *udpif)
 {
+#ifdef notdef
 	char *group_type;
 
 	if(config_setting_lookup_string (group_config, "type", (const char**)(&group_type)) != CONFIG_TRUE)
@@ -778,18 +780,22 @@ static void ofproto_handle_config_group(config_setting_t *group_config,struct ud
 		VLOG_ERR("ofproto_handle_config_group - unrecognized group type. skipping");
 		return;
 	}
+#endif
 }
 
 
 static int  ofproto_init_config(const char* file_name)
 {
 
+#ifdef notdef
 	config_init(&config_file_data);
 
 	return (config_read_file(&config_file_data,file_name));
+#endif
 }
 static void ofproto_apply_general_config(void * config)
 {
+#ifdef notdef
 	config_setting_t *general_config = config_lookup(&config_file_data,"general");
 	if(general_config == NULL)
 	{
@@ -800,10 +806,11 @@ static void ofproto_apply_general_config(void * config)
 	{
 		VLOG_ERR("apply_general_config - could not find flow deletion algo. bye.\n");
 	}
-
+#endif
 }
 static void  ofproto_apply_config(struct udpif *udpif)
 {
+#ifdef notdef 
 	char group_name[32];
 	int group_index = 1;
 	int end_loop = 0;
@@ -824,6 +831,7 @@ static void  ofproto_apply_config(struct udpif *udpif)
 				end_loop = 1;
 			}
 		}
+#endif
 }
 
 
@@ -1252,12 +1260,12 @@ udpif_revalidator(void *arg)
     		/*VLOG_ERR("read_config - error reading config file: %s, line:%d",
     				config_error_text(&config_file_data),config_error_line(&config_file_data));*/
     		// set defaults
-    		udpif->flow_eviction_algorithm = OFPROTO_STD_FLOW_EVICTION;
-    		/*udpif->sbcr_sliding_window_size= 20;
+    		udpif->flow_eviction_algorithm = OFPROTO_SBCR_FLOW_EVICTION;
+    		udpif->sbcr_sliding_window_size= 20;
     		udpif->sbcr_learning_rate = 5000;
     		udpif->sbcr_eviction_rate = 1000;
-    		udpif->sbcr_usage_cleaning_intensity = 90;
-    		udpif->sbcr_span_cleaning_intensity = 90;*/
+    		udpif->sbcr_usage_cleaning_intensity = 60;
+    		udpif->sbcr_span_cleaning_intensity = 40;
     /*	} */
 
     	/*VLOG_INFO(" sbcr params read   - algo-selected %d window-size %d learning-rate-ms %d eviction-rate-ms %d usgae-clean-percent %d span-clean-percent %d" ,
