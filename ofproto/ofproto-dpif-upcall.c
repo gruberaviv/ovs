@@ -14,6 +14,8 @@
 
 #include <config.h>
 #include "ofproto-dpif-upcall.h"
+// avi_c - add libconfig
+#include <libconfig.h>
 
 #include <errno.h>
 #include <stdbool.h>
@@ -176,6 +178,46 @@ struct udpif {
     uint64_t conn_seq;                 /* Corresponds to 'dump_seq' when
                                           conns[n_conns-1] was stored. */
     size_t n_conns;                    /* Number of connections waiting. */
+
+    /* SBCR working area mutex */
+    struct ovs_mutex sbcr_mutex;
+
+    /* SBCR Configuration fields */
+    uint8_t     flow_eviction_algorithm;  /* standard/sbcr */
+    uint64_t	sbcr_sliding_window_size; /* sbcr sliding-window size */
+    uint64_t	sbcr_learning_rate;       /* sbcr update rate */
+    uint64_t	sbcr_eviction_rate;       /* sbcr eviction rate */
+    uint64_t    sbcr_usage_cleaning_intensity;
+    uint64_t    sbcr_span_cleaning_intensity;
+
+    /* General config */
+    uint64_t sbcr_flow_idle_time;
+    uint64_t sbcr_fast_flow_idle_time;
+
+    uint64_t sbcr_flow_hard_limit;
+    /* number of flows at which eviction from the kernel flow table will occur */
+    uint64_t sbcr_flow_limit;
+
+
+    /* SBCR runtime flags to trigger operation */
+    bool        sbcr_update;        /* flag - set by parent - to indicates that in this dump phase we have to update sbcr scores */
+    bool        sbcr_evict;         /* flag - set by parent - to indicates that in this dump phase we have to evict according  sbcr scores */
+
+    /* SBCR runtime calculation */
+    uint64_t sbcr_pkts_usage_cutoff;
+    uint64_t sbcr_bytes_usage_cutoff;
+    uint64_t sbcr_span_cutoff;
+    uint64_t    sbcr_last_learning_time;  /* last sbcr learning/update time ms */
+    uint64_t    sbcr_last_eviction_time;  /* last sbcr eviction operation time ms */
+
+#ifdef notdef
+
+    // we currently work w cutoff-score so we dont need a sorted tree
+    struct heap sbcr_usage; /* usage heap flow nodes   */
+    struct heap sbcr_span; /* span heap flow nodes  */
+    struct heap sbcr_diriness; /* dirtiness heap flow nodes  */
+#endif
+
 };
 
 enum upcall_type {
@@ -228,6 +270,7 @@ struct upcall {
     uint64_t dump_seq;             /* udpif->dump_seq at translation time. */
     uint64_t reval_seq;            /* udpif->reval_seq at translation time. */
 
+
     /* Not used by the upcall callback interface. */
     const struct nlattr *key;      /* Datapath flow key. */
     size_t key_len;                /* Datapath flow key length. */
@@ -236,6 +279,22 @@ struct upcall {
     uint64_t odp_actions_stub[1024 / 8]; /* Stub for odp_actions. */
 };
 
+/* Sbcr scores */
+
+struct sbcr_flow_score {
+    uint64_t pkt_usage;
+    uint64_t byte_usage;
+    uint64_t span;
+    uint32_t dirtiness;
+};
+
+ struct ring_buf {
+	void *low;     // data buffer memory address low
+    void *high; // data buffer memory address high
+    size_t n_snapshot;  // window-size = maximum number of items in the buffer
+    size_t sz;  // sizeof (dpif_flow_stats)
+    void *rp;       // ring pointer to push data
+};
 /* 'udpif_key's are responsible for tracking the little bit of state udpif
  * needs to do flow expiration which can't be pulled directly from the
  * datapath.  They may be created by any handler or revalidator thread at any
@@ -263,6 +322,9 @@ struct udpif_key {
 
     struct ovs_mutex mutex;                   /* Guards the following. */
     struct dpif_flow_stats stats OVS_GUARDED; /* Last known stats.*/
+    struct sbcr_flow_score sbcr_scores OVS_GUARDED; /* Last updated flow scores */
+    struct ring_buf sbcr_rb OVS_GUARDED;           /* SBCR ring-buffer */
+
     long long int created OVS_GUARDED;        /* Estimate of creation time. */
     uint64_t dump_seq OVS_GUARDED;            /* Tracks udpif->dump_seq. */
     uint64_t reval_seq OVS_GUARDED;           /* Tracks udpif->reval_seq. */
@@ -328,7 +390,8 @@ static void upcall_unixctl_purge(struct unixctl_conn *conn, int argc,
                                  const char *argv[], void *aux);
 
 static struct udpif_key *ukey_create_from_upcall(struct upcall *,
-                                                 struct flow_wildcards *);
+                                                 struct flow_wildcards *,
+												 const struct udpif *);
 static int ukey_create_from_dpif_flow(const struct udpif *,
                                       const struct dpif_flow *,
                                       struct udpif_key **);
@@ -359,6 +422,119 @@ static dp_purge_callback dp_purge_cb;
 
 static atomic_bool enable_megaflows = ATOMIC_VAR_INIT(true);
 static atomic_bool enable_ufid = ATOMIC_VAR_INIT(true);
+
+
+// avi_c
+//static int sbcr_flow_idle_time; // ms
+//static int sbcr_flow_idle_time_fast;  // ms
+/* working area to calculate score cutoff's */
+static uint64_t sbcr_sorted_usage_score[OFPROTO_FLOW_LIMIT_DEFAULT];
+static uint64_t sbcr_sorted_span_score[OFPROTO_FLOW_LIMIT_DEFAULT];
+
+static uint64_t sbcr_sorted_usage_score_index=0;
+static uint64_t sbcr_sorted_span_score_index=0;
+
+static config_t config_file_data;
+
+#define ELEM_SWAP(a,b) { register uint64_t t=(a);(a)=(b);(b)=t; }
+/*---------------------------------------------------------------------------
+   Function   :   kth_smallest()
+   Input      :   array of elements, # of elements in the array, rank k
+   Output     :   cutoff
+   description:   find the kth smallest element in the array
+
+ ---------------------------------------------------------------------------*/
+static uint64_t kth_smallest(uint64_t a[], int n, int k)
+{
+    register i,j,l,m ;
+    register uint64_t x ;
+
+	//printf("kth_smallest array size %d kth %d\n",n,k);
+    fprintf( stderr, "Your message here" );
+
+    if (k>n)
+    {
+    	// TODO: error handle
+    	return 0;
+    }
+
+    l=0 ; m=n-1 ;
+    while (l<m) {
+        x=a[k] ;
+        i=l ;
+        j=m ;
+        do {
+            while (a[i]<x) i++ ;
+            while (x<a[j]) j-- ;
+            if (i<=j) {
+                ELEM_SWAP(a[i],a[j]) ;
+                i++ ; j-- ;
+            }
+        } while (i<=j) ;
+        if (j<k) l=i ;
+        if (k<i) m=j ;
+    }
+    return a[k] ;
+}
+
+static void sbcr_rb_init(struct ring_buf *rb, size_t n_snapshot, size_t sz)
+{
+    rb->low = malloc(n_snapshot * sz);
+    if(rb->low == NULL)
+    	VLOG_ERR("ofproto rb_init malloc failed");
+
+    rb->high = (char *)rb->low + n_snapshot * sz;
+    rb->n_snapshot = n_snapshot;
+    rb->sz = sz;
+    rb->rp = rb->low;
+}
+
+static void sbcr_rb_free(struct ring_buf *rb)
+{
+    free(rb->low);
+}
+
+// push item to back buffer
+static void sbcr_rb_push(struct ring_buf *rb, const void *item)
+{
+    memcpy(rb->rp, item, rb->sz);
+    rb->rp = (char*)rb->rp + rb->sz;
+    if(rb->rp == rb->high) // wrap around
+        rb->rp = rb->low;
+}
+
+// get first item -  the oldest snapshot
+static void *sbcr_rb_get_1st(struct ring_buf *rb)
+{
+    return (rb->rp);
+}
+
+// get last item - the most fresh snapshot
+static void *sbcr_rb_get_last(struct ring_buf *rb)
+{
+	if (rb->rp == rb->low)
+		return (rb->high);
+	return ((char*)rb->rp - rb->sz);
+}
+
+
+// get next item
+static void *sbcr_rb_get_next(struct ring_buf *rb, void* last)
+{
+	last = (char*)last + rb->sz;
+	if(last == rb->high)  // wrap around
+	    last = rb->low;
+	return (last);
+}
+
+// get prev item - reversed
+static void *sbcr_rb_get_prev (struct ring_buf *rb, void* last)
+{
+	if(last == rb->low)  // wrap around
+     return (rb->high);
+	return ((char*)last - rb->sz);
+}
+
 
 void
 udpif_init(void)
@@ -402,6 +578,8 @@ udpif_create(struct dpif_backer *backer, struct dpif *dpif)
     atomic_init(&udpif->n_flows, 0);
     atomic_init(&udpif->n_flows_timestamp, LLONG_MIN);
     ovs_mutex_init(&udpif->n_flows_mutex);
+    ovs_mutex_init(&udpif->sbcr_mutex);
+
     udpif->ukeys = xmalloc(N_UMAPS * sizeof *udpif->ukeys);
     for (int i = 0; i < N_UMAPS; i++) {
         cmap_init(&udpif->ukeys[i].cmap);
@@ -450,6 +628,7 @@ udpif_destroy(struct udpif *udpif)
     seq_destroy(udpif->reval_seq);
     seq_destroy(udpif->dump_seq);
     ovs_mutex_destroy(&udpif->n_flows_mutex);
+    ovs_mutex_destroy(&udpif->sbcr_mutex);
     free(udpif);
 }
 
@@ -498,6 +677,156 @@ udpif_stop_threads(struct udpif *udpif)
     }
 }
 
+#ifdef notdef
+static void ofproto_read_timers_group(config_setting_t *group_config)
+{
+	if(config_setting_lookup_int (group_config, "flow_idle_time", &sbcr_flow_idle_time) != CONFIG_TRUE)
+	{
+		printf("read_timers_group - could not find flow_idle_time in group. skipping.\n");
+		return;
+	}
+
+	if(config_setting_lookup_int (group_config, "flow_idle_time_fast", &sbcr_flow_idle_time_fast) != CONFIG_TRUE)
+	{
+		printf("read_timers_group - could not find flow_idle_time_fast in group. skipping.\n");
+		return;
+	}
+
+}
+#endif
+
+
+static void ofproto_read_flow_limit_group(config_setting_t *group_config,struct udpif *udpif)
+{
+#ifdef notdef
+	if(config_setting_lookup_int (group_config, "sbcr_flow_hard_limit", (int64_t*)&udpif->sbcr_flow_hard_limit) != CONFIG_TRUE)
+	{
+		VLOG_ERR ("read_flow_limit_group - could not find sbcr_flow_hard_limit in group. skipping");
+
+	}
+	else
+		ofproto_flow_limit = udpif->sbcr_flow_hard_limit;
+
+	if(config_setting_lookup_int (group_config, "sbcr_flow_limit",  (int64_t*)&udpif->sbcr_flow_limit) != CONFIG_TRUE)
+	{
+		VLOG_ERR ("read_flow_limit_group - could not find sbcr_flow_limit in group. skipping");
+	}
+
+	else
+		atomic_init(&udpif->flow_limit, MIN(ofproto_flow_limit, udpif->sbcr_flow_limit));
+#endif
+}
+
+
+
+static void ofproto_read_sbcr_params_group(config_setting_t *group_config,struct udpif *udpif)
+{
+	if(config_setting_lookup_int (group_config, "sliding_window_size", (int64_t*)&udpif->sbcr_sliding_window_size) != CONFIG_TRUE)
+	{
+		VLOG_ERR ("read_sbcr_params_group - could not find sliding_window_size in group. skipping");
+	}
+
+	if(config_setting_lookup_int (group_config, "learning_rate",  (int64_t*)&udpif->sbcr_learning_rate) != CONFIG_TRUE)
+	{
+		VLOG_ERR ("read_flow_limit_group - could not find sbcr_learning_rate in group. skipping");
+	}
+
+	if(config_setting_lookup_int (group_config, "eviction_rate",  (int64_t*)&udpif->sbcr_eviction_rate) != CONFIG_TRUE)
+	{
+		VLOG_ERR ("read_flow_limit_group - could not find sbcr_eviction_rate in group. skipping");
+	}
+
+	if(config_setting_lookup_int (group_config, "usage_cleaning_intensity",  (int64_t*)&udpif->sbcr_usage_cleaning_intensity) != CONFIG_TRUE)
+	{
+		VLOG_ERR ("read_flow_limit_group - could not find sbcr_usage_cleaning_intensity in group. skipping");
+	}
+
+	if(config_setting_lookup_int (group_config, "span_cleaning_intensity",  (int64_t*)&udpif->sbcr_span_cleaning_intensity) != CONFIG_TRUE)
+	{
+		VLOG_ERR ("read_flow_limit_group - could not find sbcr_span_cleaning_intensity in group. skipping");
+	}
+
+
+}
+
+static void ofproto_handle_config_group(config_setting_t *group_config,struct udpif *udpif)
+{
+	char *group_type;
+
+	if(config_setting_lookup_string (group_config, "type", (const char**)(&group_type)) != CONFIG_TRUE)
+	{
+		VLOG_ERR ("ofproto_handle_config_group - could not find type string in group. skipping");
+		return;
+	}
+
+
+	if(strcmp(group_type,"timers") == 0)
+	{
+		;//ofproto_read_timers_group(group_config);
+	}
+	// handle here other groups ...
+	else if(strcmp(group_type,"flow_limit") == 0)
+	{
+		ofproto_read_flow_limit_group(group_config,udpif);
+	}
+	else if(strcmp(group_type,"sbcr_params") == 0)
+	{
+		ofproto_read_sbcr_params_group(group_config,udpif);
+	}
+	else
+	{
+		VLOG_ERR("ofproto_handle_config_group - unrecognized group type. skipping");
+		return;
+	}
+}
+
+
+static int  ofproto_init_config(const char* file_name)
+{
+
+	config_init(&config_file_data);
+
+	return (config_read_file(&config_file_data,file_name));
+}
+static void ofproto_apply_general_config(void * config)
+{
+	config_setting_t *general_config = config_lookup(&config_file_data,"general");
+	if(general_config == NULL)
+	{
+		VLOG_ERR("apply_general_config - could not find general config.");
+	}
+
+	if(config_setting_lookup_int (general_config, "flow_eviction_algorithm", config) != CONFIG_TRUE)
+	{
+		VLOG_ERR("apply_general_config - could not find flow deletion algo. bye.\n");
+	}
+
+}
+static void  ofproto_apply_config(struct udpif *udpif)
+{
+	char group_name[32];
+	int group_index = 1;
+	int end_loop = 0;
+
+		ofproto_apply_general_config((void *)&(udpif->flow_eviction_algorithm));
+
+		while(!end_loop)
+		{
+			sprintf(group_name,"group%d",group_index);
+			group_index++;
+			config_setting_t *group_config = config_lookup(&config_file_data,group_name);
+			if(group_config != NULL)
+			{
+				ofproto_handle_config_group(group_config, udpif);
+			}
+			else
+			{
+				end_loop = 1;
+			}
+		}
+}
+
+
 /* Starts the handler and revalidator threads, must be enclosed in
  * ovsrcu quiescent state. */
 static void
@@ -519,6 +848,7 @@ udpif_start_threads(struct udpif *udpif, size_t n_handlers,
             handler->handler_id = i;
             handler->thread = ovs_thread_create(
                 "handler", udpif_upcall_handler, handler);
+
         }
 
         enable_ufid = ofproto_dpif_get_enable_ufid(udpif->backer);
@@ -531,12 +861,16 @@ udpif_start_threads(struct udpif *udpif, size_t n_handlers,
         udpif->pause = false;
         udpif->revalidators = xzalloc(udpif->n_revalidators
                                       * sizeof *udpif->revalidators);
+
+
+
         for (i = 0; i < udpif->n_revalidators; i++) {
             struct revalidator *revalidator = &udpif->revalidators[i];
 
             revalidator->udpif = udpif;
             revalidator->thread = ovs_thread_create(
                 "revalidator", udpif_revalidator, revalidator);
+
         }
     }
 }
@@ -822,6 +1156,75 @@ free_dupcall:
     return n_upcalls;
 }
 
+static void
+sbcr_scores_update(struct udpif_key *ukey , uint64_t n_snapshot,struct udpif *udpif)
+{
+struct dpif_flow_stats * snapshot;
+uint64_t pkt_sum=0,byte_sum=0;
+long long used_sum=0;
+
+	/* default - zero span-score */
+	ukey->sbcr_scores.span = 0;
+	/* go over all  snapshots - reversed mode */
+	snapshot = (struct dpif_flow_stats *)sbcr_rb_get_last(&ukey->sbcr_rb);
+	while (n_snapshot--)
+	{
+		pkt_sum += snapshot->n_packets;
+		byte_sum += snapshot->n_bytes;
+		used_sum += snapshot->used;
+
+		/* set only once when an active snapshot is reversal found */
+		if (snapshot->n_packets && !ukey->sbcr_scores.span)
+			ukey->sbcr_scores.span = n_snapshot+1;
+
+		snapshot = (struct dpif_flow_stats *)sbcr_rb_get_prev(&ukey->sbcr_rb, (void*) snapshot);
+	}
+
+	ukey->sbcr_scores.pkt_usage = used_sum ?  pkt_sum/used_sum:0;
+	ukey->sbcr_scores.byte_usage = used_sum ?  byte_sum/used_sum:0;
+
+	VLOG_INFO(" flow-index %d sbcr_scores_update  - usage-score %u span-score %u",
+			sbcr_sorted_usage_score_index, ukey->sbcr_scores.pkt_usage,ukey->sbcr_scores.span );            ;
+
+	/* avi_c - Mutex ???   tbd */
+	//sbcr_sorted_usage_score[sbcr_sorted_usage_score_index++]=ukey->sbcr_scores.pkt_usage ;
+	if (!ovs_mutex_trylock(&udpif->sbcr_mutex))
+	{
+		sbcr_sorted_usage_score[sbcr_sorted_usage_score_index++]=ukey->sbcr_scores.byte_usage ;
+		sbcr_sorted_span_score[sbcr_sorted_span_score_index++]=ukey->sbcr_scores.span ;
+        ovs_mutex_unlock(&udpif->sbcr_mutex);
+	}
+
+}
+
+/* Only invoked by leader after all threads completed dumping phase - hence mutex is not required */
+static void sbcr_working_area_clear(void)
+{
+	VLOG_INFO(" sbcr_working_area_clear  - sbcr_sorted_usage_score_index %d sbcr_sorted_span_score_index %d" ,
+			   sbcr_sorted_usage_score_index,sbcr_sorted_span_score_index );            ;
+	sbcr_sorted_usage_score_index=sbcr_sorted_span_score_index=0;
+}
+
+/* Only invoked by leader after all threads completed dumping phase - hence mutex is not required */
+static void
+sbcr_scores_cutoff_calc(struct udpif *udpif)
+{
+	int k1 = (int) (((sbcr_sorted_usage_score_index) *
+			         udpif->sbcr_usage_cleaning_intensity )  / 100);
+
+	int k2 = (int) (((sbcr_sorted_span_score_index) *
+			         udpif->sbcr_span_cleaning_intensity) /100);
+	if (k1)
+		udpif->sbcr_pkts_usage_cutoff =  kth_smallest(sbcr_sorted_usage_score,
+				                         	          sbcr_sorted_usage_score_index,
+													  k1);
+	if (k2)
+		udpif->sbcr_span_cutoff =  kth_smallest(sbcr_sorted_span_score,
+				                                sbcr_sorted_span_score_index,
+												k2);
+
+}
+
 static void *
 udpif_revalidator(void *arg)
 {
@@ -834,6 +1237,38 @@ udpif_revalidator(void *arg)
     long long int start_time = 0;
     uint64_t last_reval_seq = 0;
     size_t n_flows = 0;
+
+    VLOG_INFO(" udpif_revalidator -  ovs-id %d thread-id %x udpif %x " , revalidator->id ,revalidator->thread, revalidator->udpif);
+
+
+    if (leader)
+    {
+    	/* TODO: read from file */
+    	// avi_c - global configuration used by all revalidators - set by the leader
+    	/*if ( ofproto_init_config("/home/stack/ovs/sbcr.cfg") == CONFIG_TRUE)
+    		ofproto_apply_config(udpif);
+    	else
+    	{*/
+    		/*VLOG_ERR("read_config - error reading config file: %s, line:%d",
+    				config_error_text(&config_file_data),config_error_line(&config_file_data));*/
+    		// set defaults
+    		udpif->flow_eviction_algorithm = OFPROTO_STD_FLOW_EVICTION;
+    		/*udpif->sbcr_sliding_window_size= 20;
+    		udpif->sbcr_learning_rate = 5000;
+    		udpif->sbcr_eviction_rate = 1000;
+    		udpif->sbcr_usage_cleaning_intensity = 90;
+    		udpif->sbcr_span_cleaning_intensity = 90;*/
+    /*	} */
+
+    	/*VLOG_INFO(" sbcr params read   - algo-selected %d window-size %d learning-rate-ms %d eviction-rate-ms %d usgae-clean-percent %d span-clean-percent %d" ,
+    			udpif->flow_eviction_algorithm, udpif->sbcr_sliding_window_size,udpif->sbcr_learning_rate,udpif->sbcr_eviction_rate,udpif->sbcr_usage_cleaning_intensity,udpif->sbcr_span_cleaning_intensity );
+
+
+    	udpif->sbcr_last_learning_time =
+    	udpif->sbcr_last_eviction_time = time_msec();
+    	udpif->sbcr_pkts_usage_cutoff=udpif->sbcr_bytes_usage_cutoff =udpif->sbcr_span_cutoff=0 ;*/
+
+    }
 
     revalidator->id = ovsthread_id_self();
     for (;;) {
@@ -867,6 +1302,24 @@ udpif_revalidator(void *arg)
                 terse_dump = udpif_use_ufid(udpif);
                 udpif->dump = dpif_flow_dump_create(udpif->dpif, terse_dump);
             }
+            if (udpif->flow_eviction_algorithm == OFPROTO_SBCR_FLOW_EVICTION)
+
+            {
+            	if ((start_time - udpif->sbcr_last_learning_time) > udpif->sbcr_learning_rate)
+            	{
+            		udpif->sbcr_last_learning_time = start_time;
+            		udpif->sbcr_update = true;
+            	}
+            	else
+            		udpif->sbcr_update = false;
+            	if ((start_time - udpif->sbcr_last_eviction_time) > udpif->sbcr_eviction_rate)
+            	{
+            		udpif->sbcr_last_eviction_time = start_time;
+            		udpif->sbcr_evict=true;
+            	}
+            	else
+            		udpif->sbcr_evict=false;
+            }
         }
 
         /* Wait for the leader to start the flow dump. */
@@ -882,7 +1335,20 @@ udpif_revalidator(void *arg)
 
         /* Wait for all flows to have been dumped before we garbage collect. */
         ovs_barrier_block(&udpif->reval_barrier);
+
+
         revalidator_sweep(revalidator);
+
+        if (leader && udpif->sbcr_update)
+        {
+        	sbcr_scores_cutoff_calc(udpif);
+
+        	/* clear sbcr working area for next dumping phase */
+        	sbcr_working_area_clear();
+
+            VLOG_INFO("sbcr_scores_cutoff_calc  time %u ",   time_msec());
+        }
+
 
         /* Wait for all revalidators to finish garbage collection. */
         ovs_barrier_block(&udpif->reval_barrier);
@@ -1124,7 +1590,7 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
      * going to create new datapath flows for actual datapath misses, there is
      * no point in creating a ukey otherwise. */
     if (upcall->type == DPIF_UC_MISS) {
-        upcall->ukey = ukey_create_from_upcall(upcall, wc);
+        upcall->ukey = ukey_create_from_upcall(upcall, wc, udpif);
     }
 }
 
@@ -1205,7 +1671,7 @@ upcall_cb(const struct dp_packet *packet, const struct flow *flow, ovs_u128 *ufi
                    upcall.put_actions.size);
     }
 
-    if (OVS_UNLIKELY(!megaflow && wc)) {
+    if (OVS_UNLIKELY(!megaflow)) {
         flow_wildcards_init_for_packet(wc, flow);
     }
 
@@ -1455,7 +1921,7 @@ ukey_create__(const struct nlattr *key, size_t key_len,
               bool ufid_present, const ovs_u128 *ufid,
               const unsigned pmd_id, const struct ofpbuf *actions,
               uint64_t dump_seq, uint64_t reval_seq, long long int used,
-              uint32_t key_recirc_id, struct xlate_out *xout)
+              uint32_t key_recirc_id, struct xlate_out *xout, uint64_t sbcr_win_sz)
     OVS_NO_THREAD_SAFETY_ANALYSIS
 {
     struct udpif_key *ukey = xmalloc(sizeof *ukey);
@@ -1483,6 +1949,9 @@ ukey_create__(const struct nlattr *key, size_t key_len,
     ukey->stats.used = used;
     ukey->xcache = NULL;
 
+    // init  SBCR ring-buffer
+    sbcr_rb_init (&ukey->sbcr_rb, sbcr_win_sz, sizeof (struct dpif_flow_stats));
+
     ukey->key_recirc_id = key_recirc_id;
     recirc_refs_init(&ukey->recircs);
     if (xout) {
@@ -1494,14 +1963,14 @@ ukey_create__(const struct nlattr *key, size_t key_len,
 }
 
 static struct udpif_key *
-ukey_create_from_upcall(struct upcall *upcall, struct flow_wildcards *wc)
+ukey_create_from_upcall(struct upcall *upcall, struct flow_wildcards *wc, const struct udpif *udpif)
 {
     struct odputil_keybuf keystub, maskstub;
     struct ofpbuf keybuf, maskbuf;
     bool megaflow;
     struct odp_flow_key_parms odp_parms = {
         .flow = upcall->flow,
-        .mask = wc ? &wc->masks : NULL,
+        .mask = &wc->masks,
     };
 
     odp_parms.support = ofproto_dpif_get_support(upcall->ofproto)->odp;
@@ -1516,7 +1985,7 @@ ukey_create_from_upcall(struct upcall *upcall, struct flow_wildcards *wc)
 
     atomic_read_relaxed(&enable_megaflows, &megaflow);
     ofpbuf_use_stack(&maskbuf, &maskstub, sizeof maskstub);
-    if (megaflow && wc) {
+    if (megaflow) {
         odp_parms.key_buf = &keybuf;
         odp_flow_key_from_mask(&odp_parms, &maskbuf);
     }
@@ -1526,7 +1995,8 @@ ukey_create_from_upcall(struct upcall *upcall, struct flow_wildcards *wc)
                          &upcall->put_actions, upcall->dump_seq,
                          upcall->reval_seq, 0,
                          upcall->have_recirc_ref ? upcall->recirc->id : 0,
-                         &upcall->xout);
+                         &upcall->xout,
+						 udpif->sbcr_sliding_window_size);
 }
 
 static int
@@ -1579,7 +2049,7 @@ ukey_create_from_dpif_flow(const struct udpif *udpif,
     *ukey = ukey_create__(flow->key, flow->key_len,
                           flow->mask, flow->mask_len, flow->ufid_present,
                           &flow->ufid, flow->pmd_id, &actions, dump_seq,
-                          reval_seq, flow->stats.used, 0, NULL);
+                          reval_seq, flow->stats.used, 0, NULL, udpif->sbcr_sliding_window_size);
 
     return 0;
 }
@@ -1729,7 +2199,8 @@ ukey_delete__(struct udpif_key *ukey)
         xlate_cache_delete(ukey->xcache);
         ofpbuf_delete(ovsrcu_get(struct ofpbuf *, &ukey->actions));
         ovs_mutex_destroy(&ukey->mutex);
-        free(ukey);
+        sbcr_rb_free (&ukey->sbcr_rb);
+		free(ukey);
     }
 }
 
@@ -1911,6 +2382,178 @@ revalidate_ukey(struct udpif *udpif, struct udpif_key *ukey,
     }
 
     result = UKEY_KEEP;
+
+exit:
+    if (result != UKEY_DELETE) {
+        ukey->reval_seq = reval_seq;
+    }
+    if (netflow && result == UKEY_DELETE) {
+        netflow_flow_clear(netflow, &flow);
+    }
+    xlate_out_uninit(xoutp);
+    return result;
+}
+
+/* Verifies that the datapath actions of 'ukey' are still correct, and pushes
+ * 'stats' for it.
+ *
+ * Returns a recommended action for 'ukey', options include:
+ *      UKEY_DELETE The ukey should be deleted.
+ *      UKEY_KEEP   The ukey is fine as is.
+ *      UKEY_MODIFY The ukey's actions should be changed but is otherwise
+ *                  fine.  Callers should change the actions to those found
+ *                  in the caller supplied 'odp_actions' buffer.  The
+ *                  recirculation references can be found in 'recircs' and
+ *                  must be handled by the caller.
+ *
+ * If the result is UKEY_MODIFY, then references to all recirc_ids used by the
+ * new flow will be held within 'recircs' (which may be none).
+ *
+ * The caller is responsible for both initializing 'recircs' prior this call,
+ * and ensuring any references are eventually freed.
+ */
+
+
+
+static enum reval_result
+sbcr_revalidate_ukey(struct udpif *udpif, struct udpif_key *ukey,
+					const struct dpif_flow_stats *stats,
+					struct ofpbuf *odp_actions, uint64_t reval_seq,
+					struct recirc_refs *recircs)
+    OVS_REQUIRES(ukey->mutex)
+{
+    struct xlate_out xout, *xoutp;
+    struct netflow *netflow;
+    struct ofproto_dpif *ofproto;
+    struct dpif_flow_stats push,sw_push;
+    struct flow flow;
+    struct flow_wildcards dp_mask, wc;
+    enum reval_result result;
+    ofp_port_t ofp_in_port;
+    struct xlate_in xin;
+    long long int last_used;
+    int error;
+    bool need_revalidate;
+
+    result = UKEY_KEEP;
+    xoutp = NULL;
+    netflow = NULL;
+
+    ofpbuf_clear(odp_actions);
+    need_revalidate = (ukey->reval_seq != reval_seq);
+    last_used = ukey->stats.used;
+    push.used = stats->used;
+    sw_push.used = stats->used - last_used;
+    push.tcp_flags = stats->tcp_flags;
+    sw_push.n_packets = push.n_packets = (stats->n_packets > ukey->stats.n_packets
+                      ? stats->n_packets - ukey->stats.n_packets
+                      : 0);
+    sw_push.n_bytes = push.n_bytes = (stats->n_bytes > ukey->stats.n_bytes
+                    ? stats->n_bytes - ukey->stats.n_bytes
+                    : 0);
+
+    VLOG_INFO("sbcr push to ring-buffer n_bytes %u  n_packets %u time-interval-ms %u " ,
+    		   sw_push.n_bytes, sw_push.n_packets , sw_push.used );
+
+
+    /* Push data to SBCR sliding window */
+    sbcr_rb_push(&ukey->sbcr_rb, (void *) &(sw_push));
+
+    /* Configuration change */
+    if (need_revalidate && !should_revalidate(udpif, push.n_packets, last_used)) {
+    	result = UKEY_DELETE;
+        goto exit;
+    }
+
+    if (udpif->sbcr_update)
+    	sbcr_scores_update(ukey , udpif->sbcr_sliding_window_size, udpif);
+
+    if (udpif->sbcr_evict)   {
+    	if ((ukey->sbcr_scores.pkt_usage < udpif->sbcr_pkts_usage_cutoff) ||
+    		(ukey->sbcr_scores.span < udpif->sbcr_span_cutoff))	 {
+
+    	    VLOG_INFO(" sbcr removing flow usage-score %u usage-cutoff %u span-score %u span-cutoff %u" ,
+    	    		ukey->sbcr_scores.pkt_usage, udpif->sbcr_pkts_usage_cutoff,
+					ukey->sbcr_scores.span,udpif->sbcr_span_cutoff );            ;
+
+        	result = UKEY_DELETE;
+            goto exit;
+    	}
+    }
+
+    /* We will push the stats, so update the ukey stats cache. */
+    ukey->stats = *stats;
+    if (!push.n_packets && !need_revalidate) {
+        goto exit;
+    }
+
+    if (ukey->xcache && !need_revalidate) {
+        xlate_push_stats(ukey->xcache, &push);
+        goto exit;
+    }
+
+    if (odp_flow_key_to_flow(ukey->key, ukey->key_len, &flow)
+        == ODP_FIT_ERROR) {
+        goto exit;
+    }
+
+    error = xlate_lookup(udpif->backer, &flow, &ofproto, NULL, NULL, &netflow,
+                         &ofp_in_port);
+    if (error) {
+        goto exit;
+    }
+
+    if (need_revalidate) {
+        xlate_cache_clear(ukey->xcache);
+    }
+    if (!ukey->xcache) {
+        ukey->xcache = xlate_cache_new();
+    }
+
+    xlate_in_init(&xin, ofproto, &flow, ofp_in_port, NULL, push.tcp_flags,
+                  NULL, need_revalidate ? &wc : NULL, odp_actions);
+    if (push.n_packets) {
+        xin.resubmit_stats = &push;
+        xin.may_learn = true;
+    }
+    xin.xcache = ukey->xcache;
+    xlate_actions(&xin, &xout);
+    xoutp = &xout;
+
+    if (!need_revalidate) {
+        goto exit;
+    }
+
+    if (xout.slow) {
+        ofpbuf_clear(odp_actions);
+        compose_slow_path(udpif, &xout, &flow, flow.in_port.odp_port,
+                          odp_actions);
+    }
+
+    if (odp_flow_key_to_mask(ukey->mask, ukey->mask_len, ukey->key,
+                             ukey->key_len, &dp_mask, &flow)
+        == ODP_FIT_ERROR) {
+        goto exit;
+    }
+
+    /* Do not modify if any bit is wildcarded by the installed datapath flow,
+     * but not the newly revalidated wildcard mask (wc), i.e., if revalidation
+     * tells that the datapath flow is now too generic and must be narrowed
+     * down.  Note that we do not know if the datapath has ignored any of the
+     * wildcarded bits, so we may be overtly conservative here. */
+    if (flow_wildcards_has_extra(&dp_mask, &wc)) {
+        goto exit;
+    }
+
+    if (!ofpbuf_equal(odp_actions,
+                      ovsrcu_get(struct ofpbuf *, &ukey->actions))) {
+        /* The datapath mask was OK, but the actions seem to have changed.
+         * Let's modify it in place. */
+        result = UKEY_MODIFY;
+        /* Transfer recirc action ID references to the caller. */
+        recirc_refs_swap(recircs, &xoutp->recircs);
+        goto exit;
+    }
 
 exit:
     if (result != UKEY_DELETE) {
@@ -2133,6 +2776,7 @@ revalidate(struct revalidator *revalidator)
         bool kill_them_all;
 
         n_dumped = dpif_flow_dump_next(dump_thread, flows, ARRAY_SIZE(flows));
+
         if (!n_dumped) {
             break;
         }
@@ -2154,6 +2798,9 @@ revalidate(struct revalidator *revalidator)
         n_dp_flows = udpif_get_n_flows(udpif);
         kill_them_all = n_dp_flows > flow_limit * 2;
         max_idle = n_dp_flows > flow_limit ? 100 : ofproto_max_idle;
+
+
+
 
         for (f = flows; f < &flows[n_dumped]; f++) {
             long long int used = f->stats.used;
@@ -2193,11 +2840,21 @@ revalidate(struct revalidator *revalidator)
             if (!used) {
                 used = ukey->created;
             }
-            if (kill_them_all || (used && used < now - max_idle)) {
-                result = UKEY_DELETE;
-            } else {
-                result = revalidate_ukey(udpif, ukey, &f->stats, &odp_actions,
-                                         reval_seq, &recircs);
+
+            if (udpif->flow_eviction_algorithm == OFPROTO_STD_FLOW_EVICTION)
+
+            {
+            	if (kill_them_all || (used && used < now - max_idle)) {
+					 result = UKEY_DELETE;
+				} else {
+					result = revalidate_ukey(udpif, ukey, &f->stats, &odp_actions,
+					                         reval_seq, &recircs);
+				}
+            }
+            else // SBCR
+            {
+            	result = sbcr_revalidate_ukey(udpif, ukey, &f->stats, &odp_actions,
+            			                      reval_seq, &recircs);
             }
             ukey->dump_seq = dump_seq;
             ukey->flow_exists = result != UKEY_DELETE;
@@ -2276,8 +2933,13 @@ revalidator_sweep__(struct revalidator *revalidator, bool purge)
                     struct dpif_flow_stats stats;
                     COVERAGE_INC(revalidate_missed_dp_flow);
                     memset(&stats, 0, sizeof stats);
-                    result = revalidate_ukey(udpif, ukey, &stats, &odp_actions,
-                                             reval_seq, &recircs);
+                    if (udpif->flow_eviction_algorithm == OFPROTO_STD_FLOW_EVICTION)
+                    	result = revalidate_ukey(udpif, ukey, &stats, &odp_actions,
+                                             	 reval_seq, &recircs);
+                    else
+                      	result = sbcr_revalidate_ukey(udpif, ukey, &stats, &odp_actions,
+                      								  reval_seq, &recircs);
+
                 }
                 if (result != UKEY_KEEP) {
                     /* Clears 'recircs' if filled by revalidate_ukey(). */
@@ -2462,7 +3124,7 @@ upcall_unixctl_enable_ufid(struct unixctl_conn *conn, int argc OVS_UNUSED,
 static void
 upcall_unixctl_set_flow_limit(struct unixctl_conn *conn,
                               int argc OVS_UNUSED,
-                              const char *argv[],
+                              const char *argv[] OVS_UNUSED,
                               void *aux OVS_UNUSED)
 {
     struct ds ds = DS_EMPTY_INITIALIZER;

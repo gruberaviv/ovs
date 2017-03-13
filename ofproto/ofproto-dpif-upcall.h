@@ -16,6 +16,9 @@
 #define OFPROTO_DPIF_UPCALL_H
 
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
 
 struct dpif;
 struct dpif_backer;
@@ -39,5 +42,12 @@ void udpif_revalidate(struct udpif *);
 void udpif_get_memory_usage(struct udpif *, struct simap *usage);
 struct seq *udpif_dump_seq(struct udpif *);
 void udpif_flush(struct udpif *);
+
+
+
+#define OFPROTO_STD_FLOW_EVICTION 1
+#define OFPROTO_SBCR_FLOW_EVICTION 2
+
+
 
 #endif /* ofproto-dpif-upcall.h */
